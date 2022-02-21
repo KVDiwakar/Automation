@@ -1,0 +1,427 @@
+Swrvice:
+=======================================================
+
+
+@Component
+@RestController
+@RequestMapping("/app/v1")
+@Slf4j
+public class MemberService {
+	private static final String INVALID_HEADERS = "{'httpStatusCode': 412, 'httpStatusDesc':'Mandatory elements not found in http headers'}";
+
+	private static final String INVALID_CLIENT_APP = "{'httpStatusCode': 432, 'httpStatusDesc':'Invalid client app in http headers'}";
+
+	@Autowired
+	MemberDemographicHandler memberDemographicHandler;
+
+	@Autowired
+	MemberEligibilityHandler memberEligibilityHandler;
+
+	@Autowired
+	Environment env;
+
+	////// member info APPI
+
+	@GetMapping(value = "/PatientDemographic/search/{memberPlanID}", produces = { MediaType.APPLICATION_JSON_VALUE,
+			MediaType.APPLICATION_FORM_URLENCODED_VALUE })
+	public ResponseEntity<MemberDemographicSearchResponse> getMemberInfo(@RequestHeader HttpHeaders headers,
+			HttpServletRequest request, @PathVariable long memberPlanID)
+			throws IOException, CustomException, EligibilityException {
+
+		long memberId = memberPlanID;
+		String correlationID = headers.getFirst(MemberConstants.X_CORRELATION_ID);
+
+		String clientApp = headers.getFirst(MemberConstants.CLIENT_APP);
+
+		logRequester(request, headers);
+
+		validationOfHeaders(correlationID, clientApp);
+
+		MemberDemographicSearchResponse response = null;
+
+		log.info(" X-Correlation-Id: " + correlationID
+				+ " | Message : MemberDemographicSearch request received | MemberPlanId:  " + memberId);
+
+		try {
+			if (memberId > 0) {// from .net code we have used this condition
+
+				
+				response = memberDemographicHandler.processAction(correlationID, memberId);
+
+				if (response != null) {
+
+					return new ResponseEntity<>(response, HttpStatus.OK);
+
+				} else {
+
+					MemberStatus memberStatusRec = new MemberStatus();
+					memberStatusRec.setStatusCode(10010);
+					memberStatusRec.setStatusDesc(MemberConstants.STATUS_10010);
+					response = new MemberDemographicSearchResponse();
+					response.setStatusRec(memberStatusRec);
+					log.info("X-Correlation-Id: " + correlationID + " | Response Payload: "
+							+ EncryptUtils.encryptString(response.toString()) + " | MemberPlanId:  " + memberId);
+
+					return new ResponseEntity<>(response, HttpStatus.NOT_FOUND);// not
+																				// found
+				}
+			} else {
+				MemberStatus memberStatusRec = new MemberStatus();
+				memberStatusRec.setStatusCode(10040);
+				memberStatusRec.setStatusDesc(MemberConstants.STATUS_10040);
+
+				response = new MemberDemographicSearchResponse();
+				response.setStatusRec(memberStatusRec);
+				log.info("X-Correlation-Id: " + correlationID + " | Message: Invalid MemberPlanId"
+						+ EncryptUtils.encryptString(response.toString()) + " | MemberPlanId:  " + memberId);
+				return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
+
+			}
+
+		} catch (Exception e) {
+			log.error("X-Correlation-Id: " + correlationID + " | " + e.getMessage() + " | MemberPlanId:  " + memberId
+			);
+			response = new MemberDemographicSearchResponse();
+
+			return new ResponseEntity<>(response, HttpStatus.INTERNAL_SERVER_ERROR);
+
+		}
+
+	}
+	public void validationOfHeaders(String correlationID, String clientApp)
+			throws CustomException, EligibilityException {
+
+		if (correlationID == null || clientApp == null) {
+
+			throw new EligibilityException(INVALID_HEADERS);
+
+		}
+
+		if (!clientApp.equals("EPIC")) {
+			
+			log.info("client app validation");
+			throw new CustomException(INVALID_CLIENT_APP);
+
+		}
+
+	}
+
+	private void logRequester(HttpServletRequest request, HttpHeaders headers) {
+		String correlationID = headers.getFirst(MemberConstants.X_CORRELATION_ID);
+		try {
+			Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+			String currentPrincipalName = authentication.getName();
+			AuthorizationLogElements authLog = new AuthorizationLogElements("Request", "", request.getRemoteHost(),
+					request.getLocalAddr(),
+					String.format("Endpoint: %s - client-app : %s - x-correlation-id : %s",
+							this.getClass().getSimpleName(), request.getHeader("client-app"),
+							request.getHeader("x-correlation-id")),
+					request.getHeader("User-Agent"), request.getHeader("referer"));
+			authLog.setUser(currentPrincipalName);
+
+			MemberUtils.logAuthorationInfo(this.getClass().getSimpleName() + " " + authLog.toString());
+			log.info("X-Correlation-Id: " + correlationID + " | "
+					+ (String.format("Headers: %s", EncryptUtils.encryptString(headers.toString()))));
+		} catch (Exception e) {
+			log.error("Error: " + e.getMessage());
+		}
+	}
+
+}
+
+==========================================================================================================
+Handler :
+=======================================================================================
+package net.ahm.member.profile.service.handler;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+
+import javax.sql.DataSource;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Scope;
+import org.springframework.stereotype.Component;
+
+import lombok.extern.slf4j.Slf4j;
+import net.ahm.member.profile.service.dao.MemberDemographicDAO;
+import net.ahm.member.profile.service.model.MemberDemographicSearchResponse;
+
+@Component
+@Scope("prototype")
+@Slf4j
+public class MemberDemographicHandler {
+
+	@Autowired
+	private DataSource ds;
+
+	@Autowired
+	MemberDemographicDAO dao;
+
+	public MemberDemographicSearchResponse processAction(String correlationID, long memberId) throws SQLException {
+
+		MemberDemographicSearchResponse response = null;
+		Connection con = null;
+
+		try {
+
+			con = ds.getConnection();
+
+			response = dao.process(correlationID , memberId, con);
+
+		} catch (Exception e) {
+			log.error ("X-Correlation-Id: " + correlationID + " | "+e.getMessage()+" | MemberPlanId:  " + memberId, e);
+			if (null != con && !con.isClosed()) {
+				con.rollback();
+				con.close();// this will put connection back in
+							// pool.
+			}
+			throw e;
+		} finally {
+			// this will handle other errors
+			if (null != con && !con.isClosed()) {
+				con.rollback();
+				con.close();// this will put connection back in
+							// pool.
+			}
+		}
+
+		return response;
+	}
+}
+==============================================================================
+DAO:
+============================================
+package net.ahm.member.profile.service.dao;
+
+import java.sql.Clob;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+
+import org.apache.commons.dbcp2.DelegatingConnection;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.BeanUtils;
+import org.springframework.context.annotation.Scope;
+import org.springframework.stereotype.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import lombok.extern.slf4j.Slf4j;
+import net.ahm.member.profile.service.model.MemberDemographicSearchResponse;
+import net.ahm.member.profile.service.model.MemberInfo;
+import net.ahm.member.profile.service.model.MemberInfoMap;
+import net.ahm.member.profile.service.model.MemberStatus;
+import net.ahm.member.profile.service.utils.EncryptUtils;
+import net.ahm.member.profile.service.utils.MemberConstants;
+import oracle.jdbc.OracleCallableStatement;
+import oracle.jdbc.OracleClob;
+
+@Service
+@Scope("prototype")
+@Slf4j
+public class MemberDemographicDAO {
+
+	private static final String QUERY = "{call ODS.ODS_EpicIntegration.GetMemberDemographicsDetails (?,?,?)}";
+
+	public MemberDemographicSearchResponse process(String correlationID, long memberId, Connection con) {
+		OracleCallableStatement ocs = null;
+		MemberDemographicSearchResponse response = null;
+
+		System.currentTimeMillis();
+		String serviceName = "MemberDemographic";
+
+		try {
+
+			response = new MemberDemographicSearchResponse();
+			Connection t4c = ((DelegatingConnection<?>) con).getInnermostDelegate();
+			ocs = (OracleCallableStatement) t4c.prepareCall(QUERY);
+			ocs.setObject(1, memberId); // memberPlanId
+			ocs.registerOutParameter(2, Types.CLOB); // PC_MemberDemographic_OUT
+
+			ocs.registerOutParameter(3, Types.NUMERIC); // PN_RETURNCODE_OUT
+
+			long executeStartTime = System.currentTimeMillis();
+			ocs.execute();
+			long setResponseStartTime = System.currentTimeMillis();
+			log.info(" X-Correlation-Id:" + correlationID + " | " + serviceName
+					+ ": stored procedure : running time (millis) = " + (setResponseStartTime - executeStartTime)
+					+ " | MemberPlanId:  " + memberId);
+
+			log.info(" X-Correlation-Id:" + correlationID + "| Message: MemberDemographic ODS Return Code : "
+					+ ocs.getLong(3) + " | MemberPlanId:  " + memberId);
+
+			long returnCode = ocs.getLong(3);
+
+			if (MemberConstants.SUCCESS_CODE == returnCode) {
+
+				Clob odsClobMemberDetails = (OracleClob) ocs.getClob(2);
+
+				String responseString = odsClobMemberDetails.getSubString(1, (int) odsClobMemberDetails.length());
+
+				log.info("X-Correlation-Id:" + correlationID + " | Response From ODS:"
+						+ EncryptUtils.encryptString(responseString) + " | MemberPlanId:  " + memberId);
+
+				ObjectMapper mapper = new ObjectMapper();
+				MemberInfoMap memberInfoMap = mapper.readValue(responseString, MemberInfoMap.class);
+
+				MemberInfo memberInfo = MemberInfo.builder().build();
+
+				BeanUtils.copyProperties(memberInfoMap, memberInfo);
+
+				if (StringUtils.isNotEmpty(memberInfoMap.getEffectiveDate())) {
+					SimpleDateFormat eDate = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
+					java.util.Date parseet = eDate.parse(memberInfoMap.getEffectiveDate());
+					SimpleDateFormat formatEDate = new SimpleDateFormat("MM/dd/yyyy");
+					String effectiveDate = formatEDate.format(parseet);
+
+					memberInfo.setEffectiveDate(effectiveDate);
+
+				}
+				if (StringUtils.isNotEmpty(memberInfoMap.getTerminationDate())) {
+					SimpleDateFormat tDate = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
+					java.util.Date parseet = tDate.parse(memberInfoMap.getTerminationDate());
+					SimpleDateFormat formatTDate = new SimpleDateFormat("MM/dd/yyyy");
+					String terminationDate = formatTDate.format(parseet);
+
+					memberInfo.setTerminationDate(terminationDate);
+
+				}
+
+				MemberStatus memberStatusRec = new MemberStatus();
+				memberStatusRec.setStatusCode(10000);
+				memberStatusRec.setStatusDesc("Successful");
+
+				response.setStatusRec(memberStatusRec);
+
+				response.setMemberInfo(memberInfo);
+				log.info("X-Correlation-Id: " + correlationID + " | Response Payload:"
+						+ EncryptUtils.encryptString(response.toString()) + " | MemberPlanId:  " + memberId);
+			} else if (returnCode == 10004) {
+
+				MemberStatus memberStatusRec = new MemberStatus();
+				memberStatusRec.setStatusCode(10004);
+				memberStatusRec.setStatusDesc(MemberConstants.STATUS_10004);
+				response.setStatusRec(memberStatusRec);
+				log.info("X-Correlation-Id: " + correlationID + " | Response Payload:"
+						+ EncryptUtils.encryptString(response.toString()) + " | MemberPlanId:  " + memberId);
+
+			}
+
+			else {
+				response = null;
+
+			}
+
+		} catch (SQLException | ParseException | JsonProcessingException se) {
+			log.error(
+					" X-Correlation-Id: " + correlationID
+							+ "| Message: Error occurred at ODS.ODS_EpicIntegration.GetMemberDemographicsDetails  : ",
+					se + " | MemberPlanId:  " + memberId);
+		}
+
+		finally {
+			try {
+				if (ocs != null) {
+					ocs.close();
+				}
+			} catch (SQLException e) {
+				log.error(e.getMessage(), e);
+
+			}
+
+		}
+		return response;
+
+	}
+
+}
+=======================================================================================
+model
+=============================================================
+package net.ahm.member.profile.service.model;
+
+import java.util.Date;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+//@JsonInclude(JsonInclude.Include.NON_NULL)
+public class MemberInfoMap {
+	
+	@JsonProperty("FIRSTNAME")
+	 private String firstName;
+	@JsonProperty("LASTNAME")
+     private String lastName;
+	 @JsonProperty("MEMBERPLANID")
+     private long memberPlanId;
+	 @JsonProperty("MEMBERADDRESS1")
+     private String address1;
+	 @JsonProperty("MEMBERADDRESS2")
+     private String address2;
+	 @JsonProperty("MEMBERCITY")
+     private String city;
+	 @JsonProperty("MEMBERSTATE")
+     private String state;
+	 @JsonProperty("MEMBERCOUNTRY")
+     private String country;
+	 @JsonProperty("MEMBERPOSTALCODE")
+     private String postalCode;
+	 @JsonFormat(pattern="MM-dd-yyyy")
+	 @JsonProperty("MEMBERDOB")
+     private String dob;
+	 @JsonProperty("MEMBERGENDER")
+     private String gender;
+	 @JsonProperty("CLIENTNAME")
+     private String clientName;
+	 @JsonProperty("MASTERSUPPLIERNAME")
+     private String masterSupplierName;
+	 @JsonProperty("MASTERSUPPLIERID")
+     private int masterSupplierId;
+	 @JsonProperty("SUPPLIERNAME")
+     private String supplierName;
+	 @JsonProperty("SUPPLIERID")
+     private int supplierId;
+	 @JsonFormat(pattern="MM-dd-yyyy")
+	 @JsonProperty("MEMBEREFFECTIVEDATE")
+     private String effectiveDate;
+	 @JsonProperty("ELIGIBILITYTERMINATIONDATE")
+     private String terminationDate;
+	 @JsonProperty("HOMEPHONENUMBER")
+     private String homePhoneNumber;
+	 @JsonProperty("WORKPHONENUMBER")
+     private String workPhoneNumber;
+	 @JsonProperty("PHONEEXTENSION")
+     private String phoneExtension;
+	 @JsonProperty("FAX")
+     private String fax;
+	 @JsonProperty("EMAIL")
+     private String email;
+	 @JsonProperty("RACE")
+     private String race;
+	 @JsonProperty("MIDDLEINITIAL")
+     private String middleInitial;
+	 @JsonProperty("NAMESUFFIX")
+     private String nameSuffix;
+	 @JsonProperty("RELATIONSHIPID")
+     private String relationshipId;
+	 @JsonProperty("PLANID")
+     private int planId;
+	
+	}
+
+
